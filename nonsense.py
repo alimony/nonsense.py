@@ -13,67 +13,65 @@
 #
 # Do what you want with it, but please give credit and contribute improvements!
 
-import sqlite3
+import psycopg2
 import sys
 import random
 import re
+
+WRITE_TO_DB_AFTER_NUM_WORDS = 2000
 
 def stderr(str):
     sys.stderr.write(str + "\n")
 
 class MarkovChain(object):
-    def __init__(self, input_file=None, lookback=3, no_cache=False):
+    def __init__(self, input_file=None, lookback=3):
         self.WORD_RE = re.compile(r"([\w\.\!\,]+)", re.UNICODE)
         self.NO_REAL_WORD_RE = re.compile(r"^[\d\.\,\:\;]*$")
         self.lookback = lookback
 
-        if no_cache:
-            self.conn = sqlite3.connect(":memory:")
-        else:
-            self.conn = sqlite3.connect("%s.markovdb~%d" % (input_file, lookback))
-
+        self.conn = psycopg2.connect("dbname=nonsense user=markus")
         self.c = self.conn.cursor()
 
         if input_file:
             self.input(input_file)
 
     def input(self, input_file):
-        # check if cached db already exists
-        if len(self.c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='markov_chain'").fetchall()) < 1:
-            # re-generate everything from scratch.
-            self.init_database()
-
-            with open(input_file) as file:
-                self.generate_markov_chain(file.read().decode("utf-8"))
-
-    def init_database(self):
-       self.c.execute("CREATE TABLE IF NOT EXISTS markov_chain (prefix text, suffix text, num_occurences integer DEFAULT 0, probability real, UNIQUE (prefix, suffix) )");
+        self.c.execute("CREATE TABLE IF NOT EXISTS markov_chain (id serial PRIMARY KEY, prefix text, suffix text, num_occurences integer DEFAULT 0, probability real, UNIQUE (prefix, suffix) )");
+        self.conn.commit()
+        with open(input_file) as file:
+            self.generate_markov_chain(file.read().decode("utf-8"))
 
     def generate_markov_chain(self, input):
         # interface to the db
-        def add_suffix(prefix, suffix):
-            self.c.execute("INSERT OR IGNORE INTO markov_chain (prefix, suffix) VALUES (?, ?)", (prefix, suffix))
-            self.c.execute("UPDATE markov_chain SET num_occurences = num_occurences + 1 WHERE prefix=? AND suffix=?", (prefix, suffix))
+        def save_suffixes(suffixes):
+            try:
+                self.c.executemany("INSERT INTO markov_chain (prefix, suffix) VALUES (%s, %s)", suffixes)
+            except psycopg2.IntegrityError:
+                self.conn.rollback()
+            else:
+                self.conn.commit()
+            self.c.executemany("UPDATE markov_chain SET num_occurences = num_occurences + 1 WHERE prefix=%s AND suffix=%s", suffixes)
+            self.conn.commit()
 
         # estimate num words so we can give progress
         word_count_estimate = input.count(' ') + 1
+        stderr("Total estimated number of words: %d" % word_count_estimate)
 
-        i = 0
         prev_prefixes = []
-        for match in re.finditer(self.WORD_RE, input):
+        unsaved_suffixes = []
+        for counter, match in enumerate(re.finditer(self.WORD_RE, input)):
             word = match.groups()[0].lower()
             if not re.match(self.NO_REAL_WORD_RE, word):
-                i += 1
-                if i % (word_count_estimate / 10) == 0:
-                    stderr("%d%%" % int(i / float(word_count_estimate) * 100.0))
+                if counter > 0 and counter % (word_count_estimate/10) == 0:
+                    stderr("%d%%" % int(counter/float(word_count_estimate) * 100.0))
 
                 # add all prefixes => this word tuples
                 for prefix in prev_prefixes:
-                    add_suffix(prefix, word)
+                    unsaved_suffixes.append((prefix, word))
 
                 # new meaning-prefix (if last word ended in dot)
                 if prev_prefixes and prev_prefixes[-1][-1] == ".":
-                    add_suffix("^", word)
+                    unsaved_suffixes.append(("^", word))
 
                 # generate new prefixes
                 if len(prev_prefixes) >= self.lookback:
@@ -83,20 +81,30 @@ class MarkovChain(object):
                 prev_prefixes = [prefix + " " + word for prefix in prev_prefixes]
                 prev_prefixes.append(word)
 
+                # flush suffixes to database
+                if counter % WRITE_TO_DB_AFTER_NUM_WORDS == 0:
+                    save_suffixes(unsaved_suffixes)
+                    unsaved_suffixes = []
+
+            # final save of suffixes to database
+            save_suffixes(unsaved_suffixes)
+            unsaved_suffixes = []
+
         self.conn.commit()
 
         stderr("Calculating probabilities...")
 
         # re-count from num occurences of each suffix => probability (from 0.0 - 1.0)
-        for row in self.c.execute("SELECT prefix, sum(num_occurences) FROM markov_chain GROUP BY prefix").fetchall():
-            self.c.execute("UPDATE markov_chain SET probability=((1.0*num_occurences)/?) WHERE prefix=?", (float(row[1]), row[0]))
+        self.c.execute("SELECT prefix, sum(num_occurences) FROM markov_chain GROUP BY prefix")
+        for row in self.c.fetchall():
+            self.c.execute("UPDATE markov_chain SET probability=((1.0*num_occurences)/%s) WHERE prefix=%s", (float(row[1]), row[0]))
 
         self.conn.commit()
 
     def choose_next_word(self, from_prefix):
         random_choice = random.random()
         i = 0
-        for row in self.c.execute("SELECT suffix, probability FROM markov_chain WHERE prefix=? ORDER BY RANDOM()", (from_prefix,)):
+        for row in self.c.execute("SELECT suffix, probability FROM markov_chain WHERE prefix=%s ORDER BY RANDOM()", (from_prefix,)):
            i += row[1]
            if i >= random_choice:
                return row[0]
@@ -125,7 +133,6 @@ class MarkovChain(object):
                     if suggestion:
                         break
 
-
             if not suggestion:
                 break
 
@@ -149,7 +156,6 @@ if __name__ == "__main__":
     start_word = None
     max_length = 140
     lookback = 3
-    no_cache = False
     only_cache = False
 
     # ugly but simple enough argument handling
@@ -169,10 +175,6 @@ if __name__ == "__main__":
         i = args.index("--lookback")
         lookback = args[i+1]
         del args[i+1]
-    if "--no-cache" in args:
-        i = args.index("--no-cache")
-        no_cache = True
-        del args[i]
     if "--only-cache" in args:
         i = args.index("--only-cache")
         only_cache = True
@@ -182,7 +184,7 @@ if __name__ == "__main__":
     source = args[0]
 
     stderr("Generating Markov chain for input %s..." % source)
-    markov_chain = MarkovChain(input_file=args[0], lookback=lookback, no_cache=no_cache)
+    markov_chain = MarkovChain(input_file=args[0], lookback=lookback)
 
     if only_cache:
         stderr("Told to only generate a cache, so exiting now.")
