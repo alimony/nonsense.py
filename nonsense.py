@@ -76,8 +76,8 @@ class MarkovChain(object):
         for counter, match in enumerate(re.finditer(self.WORD_RE, input)):
             word = match.groups()[0].lower()
             if not re.match(self.NO_REAL_WORD_RE, word):
-                if counter % (word_count_estimate/10) == 0:
-                    stderr("%d%%" % int(counter/float(word_count_estimate) * 100.0))
+                if counter % int(word_count_estimate/10.0) == 0:
+                    stderr("%d%%" % round(counter/float(word_count_estimate) * 100.0))
 
                 # add all prefixes => this word tuples
                 for prefix in prev_prefixes:
