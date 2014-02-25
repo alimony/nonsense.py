@@ -4,7 +4,7 @@
 # Reads input and generates nonsense based on it.
 #
 # Usage:
-# ./nonsense.py [--lookback N] [--startword Hello] [--min-length 20] [--max-length 300] [--no-cache] [--only-cache] input_file_with_lotsa_words.txt
+# ./nonsense.py [--lookback N] [--startword Hello] [--min-length 20] [--max-length 300] [--no-cache] [--only-cache] [--db sqlite|postgres dsn] input_file_with_lotsa_words.txt
 #
 # Has quite good performance compared to last version. With the swedish bible
 # it needs about 20MB RAM and can create new sentences in ~0.1s with a prebuilt cache.
@@ -13,7 +13,6 @@
 #
 # Do what you want with it, but please give credit and contribute improvements!
 
-import sqlite3
 import sys
 import random
 import datetime
@@ -21,22 +20,37 @@ import re
 
 WRITE_TO_DB_AFTER_NUM_WORDS = 5000
 
+
 def stderr(str):
     sys.stderr.write(str + "\n")
 
+
 def simple_time_diff(str, d1, d2):
-    stderr("Execution for %s took %d seconds" % (str, (d2-d1).seconds))
+    seconds = (d2-d1).seconds
+    stderr("Execution for %s took %d second%s" % (str, seconds, ("s" if seconds > 1 else "")))
+
 
 class MarkovChain(object):
-    def __init__(self, input_file=None, lookback=3, no_cache=False):
+    def __init__(self, input_file=None, lookback=3, no_cache=False, db="sqlite", dsn=None):
         self.WORD_RE = re.compile(r"([\w\.\!\,]+)", re.UNICODE)
         self.NO_REAL_WORD_RE = re.compile(r"^[\d\.\,\:\;]*$")
         self.lookback = lookback
+        self.db = db
 
-        if no_cache:
-            self.conn = sqlite3.connect(":memory:")
+        if self.db == "sqlite":
+            import sqlite3
+            self.placeholder = '?'
+            if no_cache:
+                self.conn = sqlite3.connect(":memory:")
+            else:
+                self.conn = sqlite3.connect("%s.markovdb~%d" % (input_file, lookback))
+        elif self.db == "postgres":
+            import psycopg2
+            self.placeholder = '%s'
+            self.conn = psycopg2.connect(dsn)
         else:
-            self.conn = sqlite3.connect("%s.markovdb~%d" % (input_file, lookback))
+            stderr("Database '%s' is not supported" % db)
+            sys.exit(1)
 
         self.c = self.conn.cursor()
 
@@ -45,7 +59,12 @@ class MarkovChain(object):
 
     def input(self, input_file):
         # check if cached db already exists
-        if len(self.c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='markov_chain'").fetchall()) < 1:
+        if self.db == "sqlite":
+            query = "SELECT name FROM sqlite_master WHERE type='table' AND name='markov_chain'"
+        elif self.db == "postgres":
+            query = "SELECT table_name FROM information_schema.tables WHERE table_name='markov_chain'"
+        self.c.execute(query)
+        if not self.c.fetchone():
             # re-generate everything from scratch.
             self.init_database()
 
@@ -53,13 +72,23 @@ class MarkovChain(object):
                 self.generate_markov_chain(file.read().decode("utf-8"))
 
     def init_database(self):
-       self.c.execute("CREATE TABLE IF NOT EXISTS markov_chain (prefix text, suffix text, num_occurrences integer DEFAULT 0, probability real)");
-       self.c.execute("CREATE INDEX prefix_index ON markov_chain (prefix)")
+        self.c.execute("CREATE TABLE IF NOT EXISTS markov_chain (prefix text, suffix text, num_occurrences integer DEFAULT 0, probability real)")
+        self.c.execute("CREATE INDEX prefix_index ON markov_chain (prefix)")
+        self.conn.commit()
+
+    def vacuum(self):
+        if self.db == 'sqlite':
+            self.c.execute("VACUUM")
+        elif self.db == 'postgres':
+            old_isolation_level = self.conn.isolation_level
+            self.conn.set_isolation_level(0)
+            self.c.execute("VACUUM FULL")
+            self.conn.set_isolation_level(old_isolation_level)
 
     def generate_markov_chain(self, input):
         # interface to the db
         def save_suffixes(suffixes):
-            self.c.executemany("INSERT INTO markov_chain_temp (prefix, suffix) VALUES (?, ?)", suffixes)
+            self.c.executemany("INSERT INTO markov_chain_temp (prefix, suffix) VALUES (%s, %s)" % (self.placeholder, self.placeholder), suffixes)
 
         d1 = datetime.datetime.now()
 
@@ -69,7 +98,7 @@ class MarkovChain(object):
         self.c.execute("CREATE INDEX prefix_suffix_index ON markov_chain_temp (prefix, suffix)")
 
         # estimate num words so we can give progress
-        word_count_estimate = input.count(' ') + 1
+        word_count_estimate = input.count(" ") + 1
 
         prev_prefixes = []
         unsaved_suffixes = []
@@ -102,7 +131,6 @@ class MarkovChain(object):
 
         # final save of suffixes to database
         save_suffixes(unsaved_suffixes)
-        unsaved_suffixes = []
 
         self.conn.commit()
 
@@ -127,13 +155,14 @@ class MarkovChain(object):
         stderr("Calculating probabilities...")
 
         # re-count from num occurences of each suffix => probability (from 0.0 - 1.0)
-        for row in self.c.execute("SELECT prefix, sum(num_occurrences) FROM markov_chain GROUP BY prefix").fetchall():
-            self.c.execute("UPDATE markov_chain SET probability=((1.0*num_occurrences)/?) WHERE prefix=?", (float(row[1]), row[0]))
+        self.c.execute("SELECT prefix, sum(num_occurrences) FROM markov_chain GROUP BY prefix")
+        for row in self.c.fetchall():
+            self.c.execute("UPDATE markov_chain SET probability=((1.0*num_occurrences)/%s) WHERE prefix=%s" % (self.placeholder, self.placeholder), (float(row[1]), row[0]))
 
         self.conn.commit()
 
         # vacuum database to keep disk usage to a minimum
-        self.c.execute("VACUUM")
+        self.vacuum()
         d4 = datetime.datetime.now()
 
         simple_time_diff("Probabilities and vacuuming", d3, d4)
@@ -141,10 +170,11 @@ class MarkovChain(object):
     def choose_next_word(self, from_prefix):
         random_choice = random.random()
         i = 0
-        for row in self.c.execute("SELECT suffix, probability FROM markov_chain WHERE prefix=? ORDER BY RANDOM()", (from_prefix,)):
-           i += row[1]
-           if i >= random_choice:
-               return row[0]
+        self.c.execute("SELECT suffix, probability FROM markov_chain WHERE prefix=%s ORDER BY RANDOM()" % self.placeholder, (from_prefix,))
+        for row in self.c:
+            i += row[1]
+            if i >= random_choice:
+                return row[0]
 
     def generate_sentence(self, start_word=None, min_words=5, max_length=140, prevent_recursion=False):
         first_word = None
@@ -186,7 +216,7 @@ class MarkovChain(object):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        stderr("Usage: ./nonsense.py [--lookback N] [--startword Hello] [--min-length 20] [--max-length 300] [--no-cache] [--only-cache] input_file_with_lotsa_words.txt")
+        stderr("Usage: ./nonsense.py [--lookback N] [--startword Hello] [--min-length 20] [--max-length 300] [--no-cache] [--only-cache] [--db sqlite|postgres dsn] input_file_with_lotsa_words.txt")
         sys.exit(1)
 
     # default arguments
@@ -195,6 +225,8 @@ if __name__ == "__main__":
     lookback = 3
     no_cache = False
     only_cache = False
+    db = "sqlite"
+    dsn = None
 
     # ugly but simple enough argument handling
     args = sys.argv[1:]
@@ -202,6 +234,12 @@ if __name__ == "__main__":
     if "--startword" in args:
         i = args.index("--startword")
         start_word = args[i+1].decode("utf-8")
+        del args[i+1]
+        del args[i]
+    if "--min-length" in args:
+        raise Exception("--min-length is not implemented yet!")
+        i = args.index("--min-length")
+        min_length = args[i+1]
         del args[i+1]
         del args[i]
     if "--max-length" in args:
@@ -221,12 +259,19 @@ if __name__ == "__main__":
         i = args.index("--only-cache")
         only_cache = True
         del args[i]
+    if "--db" in args:
+        i = args.index("--db")
+        db = args[i+1]
+        dsn = args[i+2]
+        del args[i+2]
+        del args[i+1]
+        del args[i]
 
     input_sources = args
     source = args[0]
 
     stderr("Generating Markov chain for input %s..." % source)
-    markov_chain = MarkovChain(input_file=args[0], lookback=lookback, no_cache=no_cache)
+    markov_chain = MarkovChain(input_file=args[0], lookback=lookback, no_cache=no_cache, db=db, dsn=dsn)
 
     if only_cache:
         stderr("Told to only generate a cache, so exiting now.")
