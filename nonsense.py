@@ -39,6 +39,7 @@ class MarkovChain(object):
 
         if self.db == "sqlite":
             import sqlite3
+            self.table_name = 'markov_chain'
             self.placeholder = '?'
             if no_cache:
                 self.conn = sqlite3.connect(":memory:")
@@ -46,6 +47,7 @@ class MarkovChain(object):
                 self.conn = sqlite3.connect("%s.markovdb~%d" % (input_file, lookback))
         elif self.db == "postgres":
             import psycopg2
+            self.table_name = 'markov_chain_%s_%d' % (input_file.replace('.', '_'), lookback)
             self.placeholder = '%s'
             self.conn = psycopg2.connect(dsn)
         else:
@@ -60,9 +62,9 @@ class MarkovChain(object):
     def input(self, input_file):
         # check if cached db already exists
         if self.db == "sqlite":
-            query = "SELECT name FROM sqlite_master WHERE type='table' AND name='markov_chain'"
+            query = "SELECT name FROM sqlite_master WHERE type='table' AND name='%s'" % self.table_name
         elif self.db == "postgres":
-            query = "SELECT table_name FROM information_schema.tables WHERE table_name='markov_chain'"
+            query = "SELECT table_name FROM information_schema.tables WHERE table_name='%s'" % self.table_name
         self.c.execute(query)
         if not self.c.fetchone():
             # re-generate everything from scratch.
@@ -72,8 +74,8 @@ class MarkovChain(object):
                 self.generate_markov_chain(file.read().decode("utf-8"))
 
     def init_database(self):
-        self.c.execute("CREATE TABLE IF NOT EXISTS markov_chain (prefix text, suffix text, num_occurrences integer DEFAULT 0, probability real)")
-        self.c.execute("CREATE INDEX prefix_index ON markov_chain (prefix)")
+        self.c.execute("CREATE TABLE IF NOT EXISTS %s (id serial primary key, prefix text, suffix text, num_occurrences integer DEFAULT 0, probability real)" % self.table_name)
+        self.c.execute("CREATE INDEX %s_prefix_index ON %s (prefix)" % (self.table_name, self.table_name))
         self.conn.commit()
 
     def vacuum(self):
@@ -88,14 +90,14 @@ class MarkovChain(object):
     def generate_markov_chain(self, input):
         # interface to the db
         def save_suffixes(suffixes):
-            self.c.executemany("INSERT INTO markov_chain_temp (prefix, suffix) VALUES (%s, %s)" % (self.placeholder, self.placeholder), suffixes)
+            self.c.executemany("INSERT INTO %s_temp (prefix, suffix) VALUES (%s, %s)" % (self.table_name, self.placeholder, self.placeholder), suffixes)
 
         d1 = datetime.datetime.now()
 
         # create "temporary" table for initial data batch
-        self.c.execute("DROP TABLE IF EXISTS markov_chain_temp")
-        self.c.execute("CREATE TABLE markov_chain_temp (prefix text, suffix text)")
-        self.c.execute("CREATE INDEX prefix_suffix_index ON markov_chain_temp (prefix, suffix)")
+        self.c.execute("DROP TABLE IF EXISTS %s_temp" % self.table_name)
+        self.c.execute("CREATE TABLE %s_temp (prefix text, suffix text)" % self.table_name)
+        self.c.execute("CREATE INDEX prefix_suffix_index ON %s_temp (prefix, suffix)" % self.table_name)
 
         # estimate num words so we can give progress
         word_count_estimate = input.count(" ") + 1
@@ -142,10 +144,10 @@ class MarkovChain(object):
         # insert all rows from the temporary table into the final table, but
         # collapsed into one row per prefix+suffix combo, with its count in the
         # as num_occurrences in the final table
-        self.c.execute("INSERT INTO markov_chain (prefix, suffix, num_occurrences)\
-            SELECT prefix, suffix, count(*) FROM markov_chain_temp GROUP BY prefix, suffix")
+        self.c.execute("INSERT INTO %s (prefix, suffix, num_occurrences)\
+            SELECT prefix, suffix, count(*) FROM %s_temp GROUP BY prefix, suffix" % (self.table_name, self.table_name))
 
-        self.c.execute("DROP TABLE markov_chain_temp")
+        self.c.execute("DROP TABLE %s_temp" % self.table_name)
 
         self.conn.commit()
 
@@ -155,9 +157,9 @@ class MarkovChain(object):
         stderr("Calculating probabilities...")
 
         # re-count from num occurences of each suffix => probability (from 0.0 - 1.0)
-        self.c.execute("SELECT prefix, sum(num_occurrences) FROM markov_chain GROUP BY prefix")
+        self.c.execute("SELECT prefix, sum(num_occurrences) FROM %s GROUP BY prefix" % self.table_name)
         for row in self.c.fetchall():
-            self.c.execute("UPDATE markov_chain SET probability=((1.0*num_occurrences)/%s) WHERE prefix=%s" % (self.placeholder, self.placeholder), (float(row[1]), row[0]))
+            self.c.execute("UPDATE %s SET probability=((1.0*num_occurrences)/%s) WHERE prefix=%s" % (self.table_name, self.placeholder, self.placeholder), (float(row[1]), row[0]))
 
         self.conn.commit()
 
@@ -170,7 +172,7 @@ class MarkovChain(object):
     def choose_next_word(self, from_prefix):
         random_choice = random.random()
         i = 0
-        self.c.execute("SELECT suffix, probability FROM markov_chain WHERE prefix=%s ORDER BY RANDOM()" % self.placeholder, (from_prefix,))
+        self.c.execute("SELECT suffix, probability FROM %s WHERE prefix=%s ORDER BY RANDOM()" % (self.table_name, self.placeholder), (from_prefix,))
         for row in self.c:
             i += row[1]
             if i >= random_choice:
