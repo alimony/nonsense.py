@@ -47,6 +47,11 @@ class MarkovChain(object):
                 self.conn = sqlite3.connect("%s.markovdb~%d" % (input_file, lookback))
         elif self.db == "postgres":
             import psycopg2
+            # In Python 2, psycopg2 returns byte string by default, so we need
+            # this to get unicode and avoid a lot of decode("utf-8")
+            import psycopg2.extensions
+            psycopg2.extensions.register_type(psycopg2.extensions.UNICODE)
+            psycopg2.extensions.register_type(psycopg2.extensions.UNICODEARRAY)
             self.table_name = 'markov_chain_%s_%d' % (input_file.replace('.', '_'), lookback)
             self.placeholder = '%s'
             self.conn = psycopg2.connect(dsn)
