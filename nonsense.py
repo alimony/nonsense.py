@@ -18,14 +18,17 @@ import sys
 import random
 import datetime
 import re
+from collections import Counter
 
-WRITE_TO_DB_AFTER_NUM_WORDS = 5000
 
 def stderr(str):
     sys.stderr.write(str + "\n")
 
+
 def simple_time_diff(str, d1, d2):
-    stderr("Execution for %s took %d seconds" % (str, (d2-d1).seconds))
+    seconds = (d2-d1).seconds
+    stderr("Execution for %s took %d second%s" % (str, seconds, ("s" if seconds > 1 else "")))
+
 
 class MarkovChain(object):
     def __init__(self, input_file=None, lookback=3, no_cache=False):
@@ -53,26 +56,19 @@ class MarkovChain(object):
                 self.generate_markov_chain(file.read().decode("utf-8"))
 
     def init_database(self):
-       self.c.execute("CREATE TABLE IF NOT EXISTS markov_chain (prefix text, suffix text, num_occurrences integer DEFAULT 0, probability real)");
-       self.c.execute("CREATE INDEX prefix_index ON markov_chain (prefix)")
+        self.c.execute("CREATE TABLE IF NOT EXISTS markov_chain (prefix text, suffix text, num_occurrences integer DEFAULT 0, probability real)")
+        self.c.execute("CREATE INDEX prefix_index ON markov_chain (prefix)")
 
     def generate_markov_chain(self, input):
-        # interface to the db
-        def save_suffixes(suffixes):
-            self.c.executemany("INSERT INTO markov_chain_temp (prefix, suffix) VALUES (?, ?)", suffixes)
-
         d1 = datetime.datetime.now()
 
-        # create "temporary" table for initial data batch
-        self.c.execute("DROP TABLE IF EXISTS markov_chain_temp")
-        self.c.execute("CREATE TABLE markov_chain_temp (prefix text, suffix text)")
-        self.c.execute("CREATE INDEX prefix_suffix_index ON markov_chain_temp (prefix, suffix)")
+        # this counter dict will keep track of all the words/prefixes
+        markov_chain_temp = Counter()
 
         # estimate num words so we can give progress
         word_count_estimate = input.count(' ') + 1
 
         prev_prefixes = []
-        unsaved_suffixes = []
         for counter, match in enumerate(re.finditer(self.WORD_RE, input)):
             word = match.groups()[0].lower()
             if not re.match(self.NO_REAL_WORD_RE, word):
@@ -81,11 +77,11 @@ class MarkovChain(object):
 
                 # add all prefixes => this word tuples
                 for prefix in prev_prefixes:
-                    unsaved_suffixes.append((prefix, word))
+                    markov_chain_temp[(prefix, word)] += 1
 
                 # new meaning-prefix (if last word ended in dot)
                 if prev_prefixes and prev_prefixes[-1][-1] == ".":
-                    unsaved_suffixes.append(("^", word))
+                    markov_chain_temp[("^", word)] += 1
 
                 # generate new prefixes
                 if len(prev_prefixes) >= self.lookback:
@@ -95,56 +91,49 @@ class MarkovChain(object):
                 prev_prefixes = [prefix + " " + word for prefix in prev_prefixes]
                 prev_prefixes.append(word)
 
-            # flush suffixes to database
-            if counter % WRITE_TO_DB_AFTER_NUM_WORDS == 0:
-                save_suffixes(unsaved_suffixes)
-                unsaved_suffixes = []
-
-        # final save of suffixes to database
-        save_suffixes(unsaved_suffixes)
-        unsaved_suffixes = []
-
-        self.conn.commit()
-
         d2 = datetime.datetime.now()
         simple_time_diff("Word indexing", d1, d2)
 
+        # Now we have a huge markov_chain_temp variable looking like this:
+        # Counter({
+        #     (u'of', u'the'): 7236,
+        #     (u'in', u'the'): 4379,
+        #     ...
+        # })
+
         stderr("Counting number of word occurrences...")
 
-        # insert all rows from the temporary table into the final table, but
-        # collapsed into one row per prefix+suffix combo, with its count in the
-        # as num_occurrences in the final table
-        self.c.execute("INSERT INTO markov_chain (prefix, suffix, num_occurrences)\
-            SELECT prefix, suffix, count(*) FROM markov_chain_temp GROUP BY prefix, suffix")
+        # count num occurences of each prefix and put in another counter dict
+        total_prefix_occurrences = Counter()
+        for (prefix, suffix), count in markov_chain_temp.items():
+            total_prefix_occurrences[prefix] += count
 
-        self.c.execute("DROP TABLE markov_chain_temp")
+        # insert all rows from the original counter dict into the final table,
+        # but collapsed into one row per prefix+suffix combo, with its count in
+        # as num_occurrences and probability calculated from both counter dicts
+        self.c.executemany("INSERT INTO markov_chain (prefix, suffix, num_occurrences, probability)\
+            VALUES (?, ?, ?, ?)", [(prefix, suffix, count,
+                                   ((1.0*count)/total_prefix_occurrences[prefix])  # probability
+                                    ) for (prefix, suffix), count in markov_chain_temp.items()])
 
         self.conn.commit()
 
         d3 = datetime.datetime.now()
         simple_time_diff("Word counting", d2, d3)
 
-        stderr("Calculating probabilities...")
-
-        # re-count from num occurences of each suffix => probability (from 0.0 - 1.0)
-        for row in self.c.execute("SELECT prefix, sum(num_occurrences) FROM markov_chain GROUP BY prefix").fetchall():
-            self.c.execute("UPDATE markov_chain SET probability=((1.0*num_occurrences)/?) WHERE prefix=?", (float(row[1]), row[0]))
-
-        self.conn.commit()
-
         # vacuum database to keep disk usage to a minimum
         self.c.execute("VACUUM")
         d4 = datetime.datetime.now()
 
-        simple_time_diff("Probabilities and vacuuming", d3, d4)
+        simple_time_diff("Vacuuming", d3, d4)
 
     def choose_next_word(self, from_prefix):
         random_choice = random.random()
         i = 0
         for row in self.c.execute("SELECT suffix, probability FROM markov_chain WHERE prefix=? ORDER BY RANDOM()", (from_prefix,)):
-           i += row[1]
-           if i >= random_choice:
-               return row[0]
+            i += row[1]
+            if i >= random_choice:
+                return row[0]
 
     def generate_sentence(self, start_word=None, min_words=5, max_length=140, prevent_recursion=False):
         first_word = None
@@ -202,6 +191,12 @@ if __name__ == "__main__":
     if "--startword" in args:
         i = args.index("--startword")
         start_word = args[i+1].decode("utf-8")
+        del args[i+1]
+        del args[i]
+    if "--min-length" in args:
+        raise Exception("--min-length is not implemented yet!")
+        i = args.index("--min-length")
+        min_length = args[i+1]
         del args[i+1]
         del args[i]
     if "--max-length" in args:
